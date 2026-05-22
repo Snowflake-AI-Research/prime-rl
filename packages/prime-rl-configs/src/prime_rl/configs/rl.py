@@ -4,6 +4,7 @@ from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import Field, model_validator
 
+from prime_rl.configs.arctic import ArcticConfig
 from prime_rl.configs.inference import InferenceConfig
 from prime_rl.configs.inference import WeightBroadcastConfig as InferenceWeightBroadcastConfig
 from prime_rl.configs.orchestrator import (
@@ -245,6 +246,18 @@ class RLConfig(BaseConfig):
     """Only validate and dump resolved configs, then exit early."""
 
     experimental: RLExperimentalConfig = RLExperimentalConfig()
+
+    arctic: Annotated[
+        ArcticConfig | None,
+        Field(
+            description=(
+                "Arctic RL integration. If None (default) or `backend=None`, the "
+                "native Prime-RL path runs unchanged. When `backend` is set, the "
+                "launcher dispatches to `rl_arctic_local` which replaces the "
+                "native trainer + inference subprocesses with the Arctic adapter."
+            )
+        ),
+    ] = None
 
     ### Validate configs (e.g. raise for unsupported (combinations of) configs)
 
@@ -680,6 +693,22 @@ class RLConfig(BaseConfig):
                     self.slurm.template_path = templates_dir / "single_node_rl.sbatch.j2"
                 else:
                     self.slurm.template_path = templates_dir / "multi_node_rl.sbatch.j2"
+        return self
+
+    @model_validator(mode="after")
+    def validate_arctic_exclusivity(self):
+        if self.arctic is None or self.arctic.backend is None:
+            return self
+        if self.inference is not None:
+            raise ValueError("Arctic mode replaces the native inference server; remove the [inference] block.")
+        if self.teacher_inference is not None:
+            raise ValueError("Arctic mode does not support teacher_inference.")
+        if self.deployment.type == "multi_node":
+            raise ValueError("Arctic is single-node only in the initial integration.")
+        if self.trainer.model.lora is not None:
+            raise ValueError("Arctic does not support LoRA (deferred).")
+        if self.trainer.max_concurrent_runs > 1:
+            raise ValueError("Arctic does not support multi-run (deferred).")
         return self
 
     ### Warnings

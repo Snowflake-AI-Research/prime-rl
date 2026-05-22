@@ -190,6 +190,22 @@ def get_free_port() -> int:
     return port
 
 
+def reserve_free_port():
+    """Return a bound TCP socket on a free port; caller owns the socket.
+
+    Unlike `get_free_port`, the port is held by the kernel via this socket
+    until the caller closes it — so a subprocess can inherit the fd (via
+    Popen pass_fds) and bind it race-free.
+    """
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("", 0))
+    s.listen(128)
+    os.set_inheritable(s.fileno(), True)
+    return s
+
+
 def get_cuda_visible_devices() -> list[int]:
     """Returns the list of availble CUDA devices, taking into account the CUDA_VISIBLE_DEVICES environment variable."""
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")

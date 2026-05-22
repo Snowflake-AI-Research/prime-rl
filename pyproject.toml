@@ -45,6 +45,8 @@ inference = "prime_rl.entrypoints.inference:main"
 trainer = "prime_rl.entrypoints.trainer:main"
 orchestrator = "prime_rl.entrypoints.orchestrator:main"
 env-server = "prime_rl.orchestrator.env_server.env_server:main"
+arctic-trainer = "prime_rl.arctic.entrypoint:main"
+arctic-shim = "prime_rl.arctic.shim.entrypoint:main"
 
 [project.entry-points."vllm.general_plugins"]
 prime_rl = "prime_rl.inference.patches:transformers_v5_compat"

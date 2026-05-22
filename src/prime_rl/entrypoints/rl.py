@@ -32,6 +32,7 @@ TRAINER_TOML = "trainer.toml"
 ORCHESTRATOR_TOML = "orchestrator.toml"
 INFERENCE_TOML = "inference.toml"
 TEACHER_INFERENCE_TOML = "teacher_inference.toml"
+ARCTIC_TOML = "arctic.toml"
 
 
 def get_physical_gpu_ids() -> list[int]:
@@ -74,6 +75,9 @@ def write_subconfigs(config: RLConfig, output_dir: Path) -> None:
 
 
 def rl_local(config: RLConfig):
+    if config.arctic is not None and config.arctic.backend is not None:
+        return rl_arctic_local(config)
+
     assert config.deployment.type == "single_node"
 
     logger = setup_logger(
@@ -558,3 +562,354 @@ def main():
 
 if __name__ == "__main__":
     main()
+def rl_arctic_local(config: RLConfig):
+    """Arctic-mode launcher: arctic-trainer + arctic-shim + orchestrator.
+
+    Replaces the native path's inference + torchrun trainer subprocesses with:
+      1. `arctic-trainer` (single-process; wraps ArcticRLClient over HTTP)
+      2. `arctic-shim` (FastAPI OAI-compat proxy to DSS /generate)
+      3. Orchestrator (unchanged, just pointed at the shim via base_url)
+
+    The trainer writes a reconnect.json to outputs/configs/ once its DSS jobs
+    are RUNNING; the launcher detects the file and passes its path to the shim
+    so the shim can call ArcticRLClient(reconnect_cfg) without /initialize.
+    """
+    import http.client
+    import urllib.error
+    import urllib.request
+
+    assert config.arctic is not None and config.arctic.backend is not None
+    arctic_cfg = config.arctic
+
+    logger = setup_logger(
+        config.log.level or os.environ.get("PRIME_LOG_LEVEL", "info"),
+        json_logging=config.log.json_logging,
+    )
+
+    # Allocate a free port dynamically so concurrent arctic runs don't conflict.
+    # Using a fixed port (e.g. 8010) would cause "address already in use" errors
+    # on machines running multiple experiments simultaneously.
+    #
+    # We bind the socket here and pass the fd to the shim via pass_fds + --fd,
+    # rather than allocating a port with get_free_port() and letting the shim
+    # bind it later. Holding the socket open eliminates a TOCTOU race where
+    # another process (typically a Ray worker spawning during sampling-engine
+    # init) grabs the same ephemeral port between allocation and the shim's
+    # actual bind. That race manifests as the shim exiting with EADDRINUSE,
+    # and the launcher's health-poll receiving garbage from whoever squatted
+    # the port.
+    shim_sock = reserve_free_port()
+    shim_port = shim_sock.getsockname()[1]
+    shim_base_url = f"http://{arctic_cfg.shim_host}:{shim_port}/v1"
+    config.orchestrator.client.base_url = [shim_base_url]
+
+    config_dir = config.output_dir / "configs"
+    write_subconfigs(config, config_dir)
+    arctic_toml_path = config_dir / ARCTIC_TOML
+    arctic_toml_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(arctic_toml_path, "wb") as f:
+        tomli_w.dump(arctic_cfg.model_dump(exclude_none=True, mode="json"), f)
+    logger.info(f"Wrote subconfigs (including arctic.toml) to {config_dir}")
+
+    if config.dry_run:
+        logger.success("Dry run complete (arctic mode).")
+        return
+
+    log_dir = get_log_dir(config.output_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    processes: list[Popen] = []
+    monitor_threads: list[Thread] = []
+    error_queue: list[Exception] = []
+    stop_events: dict[str, Event] = {}
+
+    def sigterm_handler(signum, frame):
+        logger.warning("Received SIGTERM, terminating arctic processes...")
+        cleanup_threads(monitor_threads)
+        cleanup_processes(processes)
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
+    try:
+        # 1. Start trainer. Redirect stdout+stderr to the log file directly;
+        #    no PIPE needed — trainer signals readiness via reconnect.json.
+        # Delete any stale reconnect.json from a prior run FIRST. Otherwise the
+        # launcher sees old job_ids / old zone URLs and boots the shims against
+        # ghosts while the trainer is still /initializing (or has failed).
+        (config_dir / "reconnect.json").unlink(missing_ok=True)
+        (config_dir / "judge_reconnect.json").unlink(missing_ok=True)
+
+        trainer_log_path = log_dir / "arctic_trainer.log"
+        trainer_cmd = [
+            "arctic-trainer",
+            "@",
+            (config_dir / TRAINER_TOML).as_posix(),
+        ]
+        logger.info("Starting arctic-trainer (%s)", " ".join(trainer_cmd))
+
+        trainer_env = {
+            **os.environ,
+            "ARCTIC_CONFIG_TOML": arctic_toml_path.as_posix(),
+            # Arctic trainer is single-process, no GPU on the client side.
+            "CUDA_VISIBLE_DEVICES": "",
+            "PYTHONUNBUFFERED": "1",
+            "LOGURU_FORCE_COLORS": "1",
+        }
+
+        with open(trainer_log_path, "w") as trainer_log_file:
+            trainer_process = Popen(
+                trainer_cmd,
+                env=trainer_env,
+                stdout=trainer_log_file,
+                stderr=trainer_log_file,
+            )
+        processes.append(trainer_process)
+
+        # Wait for reconnect.json, written by the trainer once DSS jobs are RUNNING.
+        # No fixed timeout: raise immediately if the trainer process exits; otherwise
+        # keep waiting. DSS's own job_timeout_seconds acts as the runaway guard.
+        reconnect_path = config_dir / "reconnect.json"
+        logger.info("Waiting for arctic-trainer to initialize DSS jobs…")
+        while not reconnect_path.exists():
+            if trainer_process.poll() is not None:
+                raise RuntimeError(
+                    f"arctic-trainer exited (code {trainer_process.returncode}) "
+                    f"before writing reconnect.json. See {trainer_log_path}."
+                )
+            time.sleep(1)
+        logger.success("arctic-trainer ready (reconnect.json written)")
+
+        stop_event = Event()
+        stop_events["arctic_trainer"] = stop_event
+        monitor_thread = Thread(
+            target=monitor_process,
+            args=(trainer_process, stop_event, error_queue, "arctic_trainer"),
+            daemon=True,
+        )
+        monitor_thread.start()
+        monitor_threads.append(monitor_thread)
+
+        # 2. Start shim. Pass the reconnect config path so it can attach to
+        #    the sampling job without calling /initialize. We pass the bound
+        #    socket fd directly (see reserve_free_port above); the child will
+        #    use it instead of binding --host/--port itself. --host/--port are
+        #    still passed as metadata (for logging) but --fd takes precedence.
+        shim_cmd = [
+            "arctic-shim",
+            "--reconnect-config",
+            reconnect_path.as_posix(),
+            "--host",
+            arctic_cfg.shim_host,
+            "--port",
+            str(shim_port),
+            "--fd",
+            str(shim_sock.fileno()),
+            "--model-name",
+            config.trainer.model.name,
+        ]
+        if arctic_cfg.enable_thinking:
+            shim_cmd.append("--enable-thinking")
+        shim_log_path = log_dir / "arctic_shim.log"
+        logger.info("Starting arctic-shim on %s:%d (fd=%d)", arctic_cfg.shim_host, shim_port, shim_sock.fileno())
+        shim_env = {**os.environ, "ARCTIC_SHIM": "1"}
+        with open(shim_log_path, "w") as shim_log_file:
+            shim_process = Popen(
+                shim_cmd,
+                stdout=shim_log_file,
+                stderr=shim_log_file,
+                env=shim_env,
+                pass_fds=(shim_sock.fileno(),),
+            )
+        processes.append(shim_process)
+        # Release our handle to the socket; the child inherited its own.
+        shim_sock.close()
+
+        # Wait for shim /health AND ready:True.
+        # The shim's /health returns 200 immediately (fire-and-forget init),
+        # but state["client"] is None until _blocking_init completes. The
+        # orchestrator's first /v1/chat/completions would race and hit
+        # AttributeError: 'NoneType'.generate() if we start it too soon.
+        import json as _json
+
+        health_url = f"http://{arctic_cfg.shim_host}:{shim_port}/health"
+        # No fixed timeout: cold imports of arctic_training+transformers+
+        # deepspeed in the shim's _blocking_init can take 2-6 minutes the first
+        # time page cache isn't warmed. Fail-fast only on process exit.
+        #
+        # Catch http.client.HTTPException too — if something other than our
+        # shim happens to be squatting on the polled port (historically this
+        # was caused by the get_free_port race now fixed via fd-passing), it
+        # may answer with non-HTTP garbage and raise BadStatusLine. Swallow
+        # it; the shim_process.poll() check above is the authoritative failure
+        # path.
+        while True:
+            if shim_process.poll() is not None:
+                raise RuntimeError(f"arctic-shim exited before becoming healthy. See {shim_log_path}.")
+            try:
+                with urllib.request.urlopen(health_url, timeout=1) as resp:
+                    if resp.status == 200:
+                        data = _json.loads(resp.read())
+                        if data.get("ready"):
+                            break
+            except (
+                urllib.error.URLError,
+                http.client.HTTPException,
+                ConnectionError,
+                TimeoutError,
+            ):
+                pass
+            time.sleep(0.5)
+        logger.success("arctic-shim healthy")
+
+        stop_event = Event()
+        stop_events["arctic_shim"] = stop_event
+        monitor_thread = Thread(
+            target=monitor_process,
+            args=(shim_process, stop_event, error_queue, "arctic_shim"),
+            daemon=True,
+        )
+        monitor_thread.start()
+        monitor_threads.append(monitor_thread)
+
+        # 2b. Start judge shim if the trainer initialized a judge sampling job.
+        reconnect_data = _json.loads(reconnect_path.read_text())
+        if reconnect_data.get("judge_sampling_job_id") and arctic_cfg.judge_model_name:
+            judge_model_name = arctic_cfg.judge_model_name
+            judge_shim_port = arctic_cfg.judge_shim_port
+
+            # Judge zone may be a different DSS on another node. Fall back to
+            # the rollout zone's host/port when judge_host/judge_port are absent
+            # (co-hosted judge, the default).
+            judge_host = reconnect_data.get("judge_host") or reconnect_data["host"]
+            judge_port = reconnect_data.get("judge_port") or reconnect_data["port"]
+
+            # Write a separate reconnect.json for the judge shim.
+            # training_job_id=-1 is a non-None sentinel so ArcticRLClient
+            # enters reconnect mode without calling /initialize.
+            judge_reconnect_path = config_dir / "judge_reconnect.json"
+            judge_reconnect_path.write_text(
+                _json.dumps(
+                    {
+                        "host": judge_host,
+                        "port": judge_port,
+                        "backend": reconnect_data["backend"],
+                        "model_name": judge_model_name,
+                        "training_job_id": -1,
+                        "sampling_job_id": reconnect_data["judge_sampling_job_id"],
+                        "log_prob_job_id": None,
+                    }
+                )
+            )
+
+            judge_shim_cmd = [
+                "arctic-shim",
+                "--reconnect-config",
+                judge_reconnect_path.as_posix(),
+                "--host",
+                arctic_cfg.shim_host,
+                "--port",
+                str(judge_shim_port),
+                "--model-name",
+                judge_model_name,
+            ]
+            if arctic_cfg.enable_thinking:
+                judge_shim_cmd.append("--enable-thinking")
+            judge_shim_log_path = log_dir / "arctic_judge_shim.log"
+            logger.info("Starting judge-shim on %s:%d", arctic_cfg.shim_host, judge_shim_port)
+            with open(judge_shim_log_path, "w") as judge_shim_log_file:
+                judge_shim_process = Popen(
+                    judge_shim_cmd, stdout=judge_shim_log_file, stderr=judge_shim_log_file, env=shim_env
+                )
+            processes.append(judge_shim_process)
+
+            judge_health_url = f"http://{arctic_cfg.shim_host}:{judge_shim_port}/health"
+            # No fixed timeout — same cold-import concern as the rollout shim.
+            while True:
+                if judge_shim_process.poll() is not None:
+                    raise RuntimeError(f"judge-shim exited before becoming healthy. See {judge_shim_log_path}.")
+                try:
+                    with urllib.request.urlopen(judge_health_url, timeout=1) as resp:
+                        if resp.status == 200 and _json.loads(resp.read()).get("ready"):
+                            break
+                except (urllib.error.URLError, ConnectionError, TimeoutError):
+                    pass
+                time.sleep(0.5)
+            logger.success("judge-shim healthy")
+
+            stop_event = Event()
+            stop_events["arctic_judge_shim"] = stop_event
+            monitor_thread = Thread(
+                target=monitor_process,
+                args=(judge_shim_process, stop_event, error_queue, "arctic_judge_shim"),
+                daemon=True,
+            )
+            monitor_thread.start()
+            monitor_threads.append(monitor_thread)
+
+        # 3. Start orchestrator (unchanged command).
+        orch_cmd = ["orchestrator", "@", (config_dir / ORCHESTRATOR_TOML).as_posix()]
+        logger.info("Starting orchestrator")
+        with open(log_dir / "orchestrator.log", "w") as orch_log_file:
+            orch_process = Popen(
+                orch_cmd,
+                stdout=orch_log_file,
+                stderr=orch_log_file,
+                env={
+                    **os.environ,
+                    "LOGURU_FORCE_COLORS": "1",
+                    "WANDB_PROGRAM": "uv run rl (arctic)",
+                    "WANDB_ARGS": json.dumps(sys.argv),
+                },
+            )
+        processes.append(orch_process)
+
+        stop_event = Event()
+        stop_events["orchestrator"] = stop_event
+        monitor_thread = Thread(
+            target=monitor_process,
+            args=(orch_process, stop_event, error_queue, "orchestrator"),
+            daemon=True,
+        )
+        monitor_thread.start()
+        monitor_threads.append(monitor_thread)
+
+        logger.success("Arctic startup complete. Tailing trainer log...")
+        tail_process = Popen(f"tail -F '{trainer_log_path}'", shell=True)
+        processes.append(tail_process)
+
+        while not (stop_events["orchestrator"].is_set() and stop_events["arctic_trainer"].is_set()):
+            if error_queue:
+                error = error_queue[0]
+                logger.error(f"Error: {error}")
+                logger.error("Terminating all arctic processes...")
+                cleanup_threads(monitor_threads)
+                cleanup_processes(processes)
+                sys.exit(1)
+            time.sleep(1)
+
+        if orch_process.returncode != 0:
+            logger.error(f"Orchestrator failed with exit code {orch_process.returncode}")
+            cleanup_threads(monitor_threads)
+            cleanup_processes(processes)
+            sys.exit(1)
+        if trainer_process.returncode != 0:
+            logger.error(f"Arctic trainer failed with exit code {trainer_process.returncode}")
+            cleanup_threads(monitor_threads)
+            cleanup_processes(processes)
+            sys.exit(1)
+
+        logger.success("Arctic RL training finished.")
+        cleanup_threads(monitor_threads)
+        cleanup_processes(processes)
+
+    except KeyboardInterrupt:
+        logger.warning("Received interrupt, terminating arctic processes...")
+        cleanup_threads(monitor_threads)
+        cleanup_processes(processes)
+        sys.exit(1)
+    except Exception:
+        cleanup_threads(monitor_threads)
+        cleanup_processes(processes)
+        raise
+

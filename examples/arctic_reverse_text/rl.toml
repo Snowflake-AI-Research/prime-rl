@@ -1,0 +1,59 @@
+# Minimal Arctic-mode example: delegates forward/backward and rollouts to an
+# Arctic RL server at arctic.url instead of running a local trainer + vLLM.
+#
+# Setup (until arctic-training is published to PyPI):
+#
+#   uv pip install \
+#     "arctic-training @ git+https://github.com/snowflake-eng/ArcticTraining-dss.git@2216b5e" \
+#     "dss-client @ git+https://github.com/snowflake-eng/dss-client.git@8f8ea10"
+#
+# Prerequisites (you provide): a running Arctic RL server with training +
+# sampling jobs available. Example server launch:
+#
+#   dss-zone --port 7000 --training-zone-size 2 --sampling-zone-size 1 \
+#            --log-prob-zone-size 1 --host 0.0.0.0
+#   dss-devices --count 4 --server-url localhost:7000 --host 0.0.0.0
+#
+# Then:
+#   uv run rl @ examples/arctic_reverse_text/rl.toml
+
+max_steps = 30
+seq_len = 2048
+
+[model]
+name = "PrimeIntellect/Qwen3-0.6B-Reverse-Text-SFT"
+
+[wandb]
+project = "primerl-arctic-reverse-text"
+name = "primerl-arctic-reverse-text"
+
+[arctic]
+backend = "dss"
+url = "http://localhost:7000"
+use_cispo_loss = false   # true: CISPO loss (ScaleRL §3.2) instead of PPO-CLIP
+loss_agg_mode = "token-mean"  # "token-mean" | "prompt-mean" | "seq-mean-token-sum" | "seq-mean-token-sum-norm" | "seq-mean-token-mean"
+
+[orchestrator]
+batch_size = 128
+rollouts_per_example = 16
+
+[orchestrator.advantage]
+type = "default"
+norm_mode = "group-mean"  # "group-mean" | "group-std" | "batch-mean" | "batch-std"
+
+[orchestrator.train.sampling]
+max_completion_tokens = 128
+
+[[orchestrator.train.env]]
+id = "reverse-text"
+
+[trainer.optim]
+lr = 3e-6
+
+[trainer.scheduler]
+type = "cosine"
+warmup_steps = 10
+
+[ckpt]
+
+# NOTE: no [inference] block — shim replaces it. Validators reject the combo.
