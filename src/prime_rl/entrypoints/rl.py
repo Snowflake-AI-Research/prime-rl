@@ -603,7 +603,7 @@ def rl_arctic_local(config: RLConfig):
     shim_sock = reserve_free_port()
     shim_port = shim_sock.getsockname()[1]
     shim_base_url = f"http://{arctic_cfg.shim_host}:{shim_port}/v1"
-    config.orchestrator.client.base_url = [shim_base_url]
+    config.orchestrator.student.client.base_url = [shim_base_url]
 
     config_dir = config.output_dir / "configs"
     write_subconfigs(config, config_dir)
