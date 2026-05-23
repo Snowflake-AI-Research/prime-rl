@@ -598,6 +598,8 @@ def rl_arctic_local(config: RLConfig):
     # actual bind. That race manifests as the shim exiting with EADDRINUSE,
     # and the launcher's health-poll receiving garbage from whoever squatted
     # the port.
+    from prime_rl.utils.utils import reserve_free_port
+
     shim_sock = reserve_free_port()
     shim_port = shim_sock.getsockname()[1]
     shim_base_url = f"http://{arctic_cfg.shim_host}:{shim_port}/v1"
