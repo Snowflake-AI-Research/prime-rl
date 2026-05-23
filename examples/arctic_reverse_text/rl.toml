@@ -55,4 +55,9 @@ warmup_steps = 10
 
 [ckpt]
 
-# NOTE: no [inference] block — shim replaces it. Validators reject the combo.
+# Model not in MODEL_RENDERER_MAP — opt into DefaultRenderer (apply_chat_template).
+[orchestrator.renderer]
+name = "default"
+
+# NOTE: no [inference] block — Arctic mode replaces the native inference server.
+#       Validators reject the combination of [arctic] + [inference].
