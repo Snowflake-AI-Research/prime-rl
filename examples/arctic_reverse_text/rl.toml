@@ -39,7 +39,6 @@ rollouts_per_example = 16
 
 [orchestrator.advantage]
 type = "default"
-norm_mode = "group-mean"  # "group-mean" | "group-std" | "batch-mean" | "batch-std"
 
 [orchestrator.train.sampling]
 max_completion_tokens = 128
